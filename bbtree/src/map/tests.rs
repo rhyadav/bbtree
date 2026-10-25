@@ -905,6 +905,136 @@ fn scans_match_std() {
     }
 }
 
+/// Copied scans match std's ranges, break as scans do, and work on a map
+/// whose root is a leaf, an empty map, and byte-array keys.
+#[test]
+fn copied_scans_match_std() {
+    let rng = TestRng::new(107);
+    let map = BBTreeMap::<u64, u64>::new();
+    let mut std_map = BTreeMap::new();
+    for number in random_numbers(&rng, 20_000, 1 << 20) {
+        map.insert(number, number * 3).unwrap();
+        std_map.insert(number, number * 3);
+    }
+    for _ in 0..300 {
+        let (a, b) = (rng.below_u64(1 << 20), rng.below_u64(1 << 20));
+        let (low, high) = (a.min(b), a.max(b));
+        let bound = |key: u64, kind: usize| match kind {
+            0 => Bound::Included(key),
+            1 if low != high => Bound::Excluded(key),
+            1 => Bound::Included(key),
+            _ => Bound::Unbounded,
+        };
+        let range = (bound(low, rng.below(3)), bound(high, rng.below(3)));
+        let mut visited = Vec::new();
+        let none: Option<()> = map.scan_copied(range, |&key, &value| {
+            visited.push((key, value));
+            ControlFlow::Continue(())
+        });
+        assert_eq!(none, None);
+        let expected: Vec<(u64, u64)> = std_map.range(range).map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(visited, expected, "{range:?}");
+    }
+    let mut seen = 0;
+    let tenth = map.scan_copied(.., |key, _| {
+        seen += 1;
+        if seen == 10 {
+            ControlFlow::Break(*key)
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    assert_eq!(tenth, std_map.keys().nth(9).copied());
+
+    let small = BBTreeMap::<u64, u64>::new();
+    assert_eq!(
+        small.scan_copied::<u64, ()>(.., |_, _| ControlFlow::Continue(())),
+        None
+    );
+    for key in [5, 1, 3] {
+        small.insert(key, key).unwrap();
+    }
+    let mut visited = Vec::new();
+    small.scan_copied(2.., |&key, _| {
+        visited.push(key);
+        ControlFlow::<()>::Continue(())
+    });
+    assert_eq!(visited, [3, 5]);
+
+    let arrays = BBTreeMap::<[u8; 16], u32>::new();
+    let mut std_arrays = BTreeMap::new();
+    for (index, number) in random_numbers(&rng, 5_000, 1 << 30).into_iter().enumerate() {
+        let key = (u128::from(number) << 64 | u128::from(number % 7)).to_be_bytes();
+        arrays.insert(key, index as u32).unwrap();
+        std_arrays.insert(key, index as u32);
+    }
+    for _ in 0..50 {
+        let start = (u128::from(rng.below_u64(1 << 30)) << 64).to_be_bytes();
+        let mut visited = Vec::new();
+        arrays.scan_copied(start.., |&key, &value| {
+            visited.push((key, value));
+            ControlFlow::<()>::Continue(())
+        });
+        let expected: Vec<([u8; 16], u32)> =
+            std_arrays.range(start..).map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(visited, expected);
+    }
+}
+
+/// Copied scans while other threads insert and remove: every key present
+/// for the whole scan is visited exactly once, in order.
+#[test]
+#[cfg_attr(target_family = "wasm", ignore = "needs threads")]
+fn copied_scans_visit_every_steady_key_once_while_others_change_the_map() {
+    let (writers, scanners, steady) = (3, 3, 30_000_u64);
+    let map = BBTreeMap::<u64, u64>::new();
+    // Even keys stay for the whole test; odd ones come and go.
+    for number in 0..steady {
+        map.insert(number * 2, number).unwrap();
+    }
+    let barrier = Barrier::new(writers + scanners);
+    thread::scope(|scope| {
+        for writer in 0..writers {
+            let (map, barrier) = (&map, &barrier);
+            scope.spawn(move || {
+                let rng = TestRng::new(700 + writer as u64);
+                barrier.wait();
+                for _ in 0..100_000 {
+                    let key = rng.below_u64(steady) * 2 + 1;
+                    if rng.below(2) == 0 {
+                        map.insert(key, key).unwrap();
+                    } else {
+                        map.remove(&key);
+                    }
+                }
+            });
+        }
+        for scanner in 0..scanners {
+            let (map, barrier) = (&map, &barrier);
+            scope.spawn(move || {
+                let rng = TestRng::new(800 + scanner as u64);
+                barrier.wait();
+                for _ in 0..40 {
+                    let start = rng.below_u64(steady * 2);
+                    let (mut previous, mut evens) = (None, 0);
+                    map.scan_copied(start.., |&key, &value| {
+                        assert!(previous < Some(key), "{previous:?} then {key}");
+                        previous = Some(key);
+                        if key % 2 == 0 {
+                            assert_eq!(value, key / 2, "the value of {key}");
+                            evens += 1;
+                        } else {
+                            assert_eq!(value, key, "the value of {key}");
+                        }
+                        ControlFlow::<()>::Continue(())
+                    });
+                    assert_eq!(evens, steady - start.div_ceil(2), "from {start}");
+                }
+            });
+        }
+    });
+}
+
 /// Scans, in both orders, while other threads insert and remove: every key
 /// present for the whole scan is visited exactly once, in the scan's order.
 #[test]

@@ -53,6 +53,7 @@ mod owner;
 mod pages;
 mod remove;
 mod scan;
+mod scan_copied;
 mod shared_prefix;
 
 pub(crate) use self::insert::{ReadOrInsert, UpdateOrInsert, WithLeaf};

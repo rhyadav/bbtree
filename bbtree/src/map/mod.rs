@@ -250,6 +250,34 @@ impl<K, V, S: InlineKeyStrategy<K>, A: Allocator> BBTreeMap<K, V, S, A> {
             .scan_rev(start, end, None, |key, value, _| f(key, value))
     }
 
+    /// [`Self::scan`] for keys and values that are `Copy` and own nothing:
+    /// runs `f` on copies of the entries, read without latching their
+    /// leaves where no thread changed a leaf meanwhile, which the leaf's
+    /// version tells, as [`Self::get_copied`] reads one entry. So scanners
+    /// write nothing to the leaves they read. A leaf that changed while it
+    /// was read sends the rest of the scan the latched way.
+    ///
+    /// Not a snapshot, as [`Self::scan`] isn't: an entry present for the
+    /// whole scan is visited exactly once.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::scan`].
+    #[inline]
+    pub fn scan_copied<Q, R>(
+        &self,
+        range: impl RangeBounds<Q>,
+        f: impl FnMut(&K, &V) -> ControlFlow<R>,
+    ) -> Option<R>
+    where
+        K: Borrow<Q> + Copy + 'static,
+        V: Copy + 'static,
+        Q: Ord + ?Sized,
+    {
+        let (start, end) = Self::checked_bounds(&range);
+        self.tree.scan_copied(start, end, f)
+    }
+
     /// An iterator over clones of the entries whose keys lie in `range`: in
     /// key order, and in reverse from its back ([`DoubleEndedIterator`]).
     ///

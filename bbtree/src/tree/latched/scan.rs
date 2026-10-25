@@ -62,7 +62,7 @@ use super::super::node::latch::{Latched, NodeLatch, Version};
 use super::super::node::leaf::Leaf;
 use super::super::node::optimistic::Routed;
 use super::LatchedTree;
-use super::descent::{DescentPath, HeldLeaf, PathLevel, Shared, TreePath};
+use super::descent::{DescentPath, HeldLeaf, LatchMode, PathLevel, Shared, TreePath};
 use crate::inline_key::InlineKeyStrategy;
 
 /// A leaf as a scan saw it: its latch, and the version it was at while the
@@ -101,11 +101,11 @@ impl PartialEq for LeafStamp<'_> {
 /// in key order goes on from the entry after it, one in reverse from the
 /// entry before it.
 #[derive(Clone, Copy)]
-struct LeafCursor(usize);
+pub(super) struct LeafCursor(usize);
 
 /// The order a scan visits entries in: [`Ascending`] or [`Descending`]. A
 /// type, so that a scan's code holds no choice between them.
-trait ScanOrder {
+pub(super) trait ScanOrder {
     /// How a key that the scan meets after a bound compares with it.
     const PAST: KeyOrdering;
 
@@ -158,7 +158,7 @@ trait ScanOrder {
     fn past(cursor: LeafCursor, visited: usize) -> LeafCursor;
 }
 
-enum Ascending {}
+pub(super) enum Ascending {}
 
 enum Descending {}
 
@@ -378,11 +378,12 @@ enum Visit<R> {
 }
 
 /// Where the scan goes after a leaf it exhausted.
-enum NextLeaf<K, V, S: InlineKeyStrategy<K>> {
+pub(super) enum NextLeaf<K, V, S: InlineKeyStrategy<K>, M: LatchMode> {
     /// The leaf was the tree's last on the scan's side.
     None,
-    /// The leaf after it, latched shared, which the path leads to now.
-    Latched(HeldLeaf<K, V, S, Shared>),
+    /// The leaf after it, latched in mode `M`, or read at a version, which
+    /// the path leads to now.
+    Latched(HeldLeaf<K, V, S, M>),
     /// A node on the way changed: search again.
     StartOver,
 }
@@ -563,7 +564,7 @@ impl<K, V, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
                 Visit::Exhausted => {}
             }
             let next = if path_kept {
-                self.next_leaf::<O>(path, &held)
+                self.next_leaf::<O, Shared>(path)
             } else {
                 path_kept = true;
                 NextLeaf::StartOver
@@ -639,15 +640,30 @@ impl<K, V, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
         &self,
         path: &mut TreePath<K, V, S>,
     ) -> (HeldLeaf<K, V, S, Shared>, LeafCursor) {
-        let held = loop {
+        let held = self.first_leaf::<O, Shared>(path);
+        let cursor = O::whole_leaf(Self::entry_count(held.leaf()));
+        (held, cursor)
+    }
+
+    /// The tree's first leaf in order `O`, latched in mode `M`, with `path`
+    /// keeping the internal nodes down to it.
+    ///
+    /// # Panics
+    ///
+    /// Without a tree.
+    pub(super) fn first_leaf<O: ScanOrder, M: LatchMode>(
+        &self,
+        path: &mut TreePath<K, V, S>,
+    ) -> HeldLeaf<K, V, S, M> {
+        loop {
             path.clear();
             let root_page = self.root_page().expect("a tree to descend");
             let root = match root_page.node() {
                 Node::Leaf(leaf) => {
-                    let held = HeldLeaf::lock(leaf);
+                    let held = HeldLeaf::<K, V, S, M>::lock(leaf);
                     // A split that raised the tree changed the tag first.
                     if self.is_root(leaf) {
-                        break held;
+                        return held;
                     }
                     continue;
                 }
@@ -658,25 +674,23 @@ impl<K, V, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
             let Some(version) = self.root_version(root) else {
                 continue;
             };
-            if let Some(held) = Self::walk_down::<O>(root, version, None, path) {
-                break held;
+            if let Some(held) = Self::walk_down::<O, M>(root, version, None, path) {
+                return held;
             }
-        };
-        let cursor = O::whole_leaf(Self::entry_count(held.leaf()));
-        (held, cursor)
+        }
     }
 
     /// The leaf after the one `path` leads to, in order `O`; the caller
-    /// holds that one (`_held`). The next leaf is latched shared before the
-    /// held one is let go. It is returned, with `path` leading to it, if
-    /// every node `path` keeps, from the nearest one with an edge on the
-    /// scan's side down, is still at the version read (module
-    /// documentation).
-    fn next_leaf<O: ScanOrder>(
+    /// holds that one, or has read it at a version it checks again once this
+    /// returns (`scan_copied.rs`). The next leaf is latched in mode `M`, or
+    /// read at a version, before the previous one is let go. It is returned,
+    /// with `path` leading to it, if every node `path` keeps, from the
+    /// nearest one with an edge on the scan's side down, is still at the
+    /// version read (module documentation).
+    pub(super) fn next_leaf<O: ScanOrder, M: LatchMode>(
         &self,
         path: &mut TreePath<K, V, S>,
-        _held: &HeldLeaf<K, V, S, Shared>,
-    ) -> NextLeaf<K, V, S> {
+    ) -> NextLeaf<K, V, S, M> {
         let depth = path.depth();
         let Some((level, edge)) = (0..depth)
             .rev()
@@ -687,11 +701,12 @@ impl<K, V, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
         let PathLevel { node, version, .. } = path.level(level);
         let mut next_path = TreePath::new();
         next_path.copy_levels_from(path, level);
-        let Some(next) = Self::walk_down::<O>(node, version, Some(edge), &mut next_path) else {
+        let Some(next) = Self::walk_down::<O, M>(node, version, Some(edge), &mut next_path) else {
             return NextLeaf::StartOver;
         };
-        // The nodes below `node` still end at the held leaf, which can't
-        // split while held: the next leaf is its neighbor.
+        // The nodes below `node` still end at the previous leaf, which can't
+        // split while held, or whose version the caller checks: the next
+        // leaf is its neighbor.
         let unchanged = (level + 1..depth).all(|below| {
             let PathLevel { node, version, .. } = path.level(below);
             node.latch().is_unchanged(version)
@@ -704,16 +719,17 @@ impl<K, V, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
     }
 
     /// Walks down from `node`, read at `version`, to a leaf, and latches it
-    /// shared. The walk leaves `node` through `edge`, or else the edge where
-    /// order `O` enters it, and each node below through the edge where `O`
-    /// enters it. It records the internal nodes in `path`, each checked hand
-    /// over hand as the descent checks them. `None` if a check fails.
-    fn walk_down<O: ScanOrder>(
+    /// in mode `M`, or reads its version. The walk leaves `node` through
+    /// `edge`, or else the edge where order `O` enters it, and each node
+    /// below through the edge where `O` enters it. It records the internal
+    /// nodes in `path`, each checked hand over hand as the descent checks
+    /// them. `None` if a check fails.
+    fn walk_down<O: ScanOrder, M: LatchMode>(
         mut node: Internal<K, V, Latched<S>>,
         mut version: Version,
         mut edge: Option<usize>,
         path: &mut TreePath<K, V, S>,
-    ) -> Option<HeldLeaf<K, V, S, Shared>> {
+    ) -> Option<HeldLeaf<K, V, S, M>> {
         loop {
             let len = node.racing_len();
             let edge_taken = edge.take().unwrap_or_else(|| O::entered_edge(len));
@@ -733,7 +749,7 @@ impl<K, V, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
             );
             match child {
                 Node::Leaf(leaf) => {
-                    let held = HeldLeaf::lock(leaf);
+                    let held = HeldLeaf::<K, V, S, M>::lock(leaf);
                     return node.latch().is_unchanged(version).then_some(held);
                 }
                 Node::Internal(child) => {
