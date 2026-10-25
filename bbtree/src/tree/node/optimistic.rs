@@ -29,9 +29,9 @@
 
 use core::borrow::Borrow;
 use core::cmp::Ordering;
-use core::mem::{ManuallyDrop, MaybeUninit};
+use core::mem::{ManuallyDrop, MaybeUninit, offset_of};
 use core::ops::Range;
-use core::ptr::NonNull;
+use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
 use super::Node;
@@ -207,6 +207,9 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
         out: &mut [MaybeUninit<RacingEntry<K, V>>],
     ) {
         debug_assert!(start + out.len() <= Self::capacity());
+        if out.is_empty() {
+            return;
+        }
         let page = self.node_ptr();
         // SAFETY: every index is below the capacity, so its key slot and
         // value slot are in the page, which is a leaf's, allocated while
@@ -215,6 +218,36 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
         unsafe {
             let keys = page.key_slots::<Self>().keys();
             let values = page.value_slots();
+            // Where the leaf pairs each key with its value in a `#[repr(C)]`
+            // entry (`layout.rs`, D29), a run of entries is one byte string
+            // of the same layout as a run of `RacingEntry`s: one copy, which
+            // the compiler widens, instead of two reads a slot. The test
+            // folds to a constant: the layouts are constants.
+            let entry_bytes = size_of::<RacingEntry<K, V>>();
+            let first_key = keys.slot(start).as_ptr().cast::<u8>().cast_const();
+            let first_value = values.slot(start).as_ptr().cast::<u8>().cast_const();
+            let paired = Self::capacity() >= 2 && entry_bytes > 0 && {
+                let stride = |a: *const u8, b: *const u8| b as usize - a as usize;
+                let key_stride = stride(
+                    keys.slot(0).as_ptr().cast::<u8>(),
+                    keys.slot(1).as_ptr().cast::<u8>(),
+                );
+                let value_stride = stride(
+                    values.slot(0).as_ptr().cast::<u8>(),
+                    values.slot(1).as_ptr().cast::<u8>(),
+                );
+                key_stride == entry_bytes
+                    && value_stride == entry_bytes
+                    && stride(first_key, first_value) == offset_of!(RacingEntry<K, V>, value)
+            };
+            if paired {
+                ptr::copy_nonoverlapping(
+                    first_key,
+                    out.as_mut_ptr().cast::<u8>(),
+                    out.len() * entry_bytes,
+                );
+                return;
+            }
             for (offset, slot) in out.iter_mut().enumerate() {
                 let index = start + offset;
                 slot.write(RacingEntry {
@@ -557,6 +590,11 @@ impl<K, V, S: InlineKeyStrategy<K>> NodePtr<K, V, S> {
 /// may change them. It may be torn, or of slots no entry fills; it is an
 /// entry the leaf held only if the leaf's version is unchanged after the
 /// read.
+///
+/// `#[repr(C)]`, key then value, as a leaf's paired entries are (`layout.rs`,
+/// D29): where the strides agree, a run of entries is copied as one byte
+/// string ([`Leaf::load_racing_entries`]).
+#[repr(C)]
 pub(in crate::tree) struct RacingEntry<K, V> {
     key: MaybeUninit<K>,
     value: MaybeUninit<V>,
