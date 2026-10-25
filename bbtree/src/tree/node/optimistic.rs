@@ -221,30 +221,12 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
             // Where the leaf pairs each key with its value in a `#[repr(C)]`
             // entry (`layout.rs`, D29), a run of entries is one byte string
             // of the same layout as a run of `RacingEntry`s: one copy, which
-            // the compiler widens, instead of two reads a slot. The test
-            // folds to a constant: the layouts are constants.
-            let entry_bytes = size_of::<RacingEntry<K, V>>();
-            let first_key = keys.slot(start).as_ptr().cast::<u8>().cast_const();
-            let first_value = values.slot(start).as_ptr().cast::<u8>().cast_const();
-            let paired = Self::capacity() >= 2 && entry_bytes > 0 && {
-                let stride = |a: *const u8, b: *const u8| b as usize - a as usize;
-                let key_stride = stride(
-                    keys.slot(0).as_ptr().cast::<u8>(),
-                    keys.slot(1).as_ptr().cast::<u8>(),
-                );
-                let value_stride = stride(
-                    values.slot(0).as_ptr().cast::<u8>(),
-                    values.slot(1).as_ptr().cast::<u8>(),
-                );
-                key_stride == entry_bytes
-                    && value_stride == entry_bytes
-                    && stride(first_key, first_value) == offset_of!(RacingEntry<K, V>, value)
-            };
-            if paired {
+            // the compiler widens, instead of two reads a slot.
+            if Self::entries_copy_as_racing() {
                 ptr::copy_nonoverlapping(
-                    first_key,
+                    keys.slot(start).as_ptr().cast::<u8>().cast_const(),
                     out.as_mut_ptr().cast::<u8>(),
-                    out.len() * entry_bytes,
+                    out.len() * size_of::<RacingEntry<K, V>>(),
                 );
                 return;
             }
@@ -255,6 +237,43 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
                     value: values.slot(index).cast().read(),
                 });
             }
+        }
+    }
+
+    /// Whether a run of this leaf's entries is one byte string of the same
+    /// layout as a run of [`RacingEntry`]s: its keys paired with its values
+    /// in `#[repr(C)]` entries (`layout.rs`, D29) of the entry's size, the
+    /// value where `RacingEntry` has it. A constant per map, which folds.
+    #[inline(always)]
+    pub(in crate::tree) fn entries_copy_as_racing() -> bool {
+        let layout = NodePtr::<K, V, S>::leaf_layout();
+        let entry = size_of::<RacingEntry<K, V>>();
+        entry > 0
+            && layout.keys.key_stride == entry
+            && layout.value_stride == entry
+            && layout.values_offset().checked_sub(layout.keys.keys_offset)
+                == Some(offset_of!(RacingEntry<K, V>, value))
+    }
+
+    /// A copy of key `index`, read in place while writers may change it: the
+    /// leaf's key `index` only if the leaf's version is unchanged after.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, if `index` is not below the capacity.
+    #[inline(always)]
+    pub(in crate::tree) fn load_racing_key(self, index: usize) -> MaybeUninit<K> {
+        debug_assert!(index < Self::capacity());
+        // SAFETY: `index` is below the capacity, so key slot `index` is in
+        // the page, which is a leaf's, allocated while threads share the
+        // tree, read as plain bytes.
+        unsafe {
+            self.node_ptr()
+                .key_slots::<Self>()
+                .keys()
+                .slot(index)
+                .cast()
+                .read()
         }
     }
 
@@ -625,6 +644,19 @@ impl<K, V> RacingEntry<K, V> {
             )
         }
     }
+
+    /// The key and value read, in place: a scan over many copies reads them
+    /// where they are instead of moving each out.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::assume_read`].
+    #[inline(always)]
+    pub(in crate::tree) unsafe fn assume_read_ref(&self) -> (&K, &V) {
+        // SAFETY: the slots held the entry's key and value throughout the
+        // read (caller).
+        unsafe { (self.key.assume_init_ref(), self.value.assume_init_ref()) }
+    }
 }
 
 /// A node latched shared until dropped, unwinding included.
@@ -640,5 +672,43 @@ impl<'a> SharedLatch<'a> {
 impl Drop for SharedLatch<'_> {
     fn drop(&mut self) {
         self.0.unlock_shared();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem::{offset_of, size_of};
+
+    use super::{Leaf, RacingEntry};
+    use crate::inline_key::Auto;
+    use crate::tree::node::latch::Latched;
+    use crate::tree::node::page::NodePtr;
+
+    /// Whether `K`'s leaves copy a run of entries as one byte string, and
+    /// that the layout agrees with `RacingEntry`'s where they do.
+    fn copies_as_one<K, V>() -> bool {
+        let layout = NodePtr::<K, V, Latched<Auto>>::leaf_layout();
+        let copies = Leaf::<K, V, Latched<Auto>>::entries_copy_as_racing();
+        if copies {
+            assert_eq!(layout.keys.key_stride, size_of::<RacingEntry<K, V>>());
+            assert_eq!(
+                layout.values_offset() - layout.keys.keys_offset,
+                offset_of!(RacingEntry<K, V>, value)
+            );
+        }
+        copies
+    }
+
+    /// The keys a copied scan is for, integers and UUIDs, pair each key with
+    /// its value in an entry laid out as `RacingEntry` is: their leaves copy
+    /// a run of entries as one byte string, whatever the value's size.
+    #[test]
+    fn integer_and_uuid_entries_copy_as_one_byte_string() {
+        assert!(copies_as_one::<u64, u64>());
+        assert!(copies_as_one::<u128, u64>());
+        assert!(copies_as_one::<[u8; 16], u64>());
+        assert!(copies_as_one::<u64, u32>());
+        assert!(copies_as_one::<u64, [u64; 4]>());
+        assert!(copies_as_one::<u64, ()>());
     }
 }

@@ -9,6 +9,12 @@
 //!   leaf's version before the closure sees it: a scan that stops early
 //!   copies little, and a chunk lives on the stack whatever the leaf's
 //!   capacity.
+//! - **The first leaf is copied from the chunk the range starts in**, placed
+//!   by the keys at the chunk boundaries, read first and checked by the
+//!   version: the chunks before it hold keys before the range, which stay
+//!   unread, as a latched scan leaves the keys before the one it searched
+//!   for. The keys copied are compared with the bound until one is at or
+//!   past it; the rest are in order, so none is compared.
 //! - **Leaf to leaf, by version.** The next leaf is found down the internal
 //!   nodes the descent kept, as a latched scan finds it, read at a version
 //!   instead of latched. Once its version is read, the previous leaf is
@@ -44,6 +50,11 @@ use crate::inline_key::InlineKeyStrategy;
 
 /// How many entries a copy takes at once.
 const CHUNK: usize = 32;
+
+/// How many keys are read, at most, to place a bound among a leaf's chunks:
+/// one at each chunk boundary, or at every so many boundaries in a leaf of
+/// many small entries.
+const PROBES: usize = 8;
 
 /// How visiting a leaf's copies ended.
 enum Visited<K, R> {
@@ -144,8 +155,8 @@ impl<K: Copy, V: Copy, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
         match self.descend::<Q, Optimistic, _>(&key, path) {
             Ok((held, _)) => FirstLeaf::At(held.leaf(), held.version()),
             // The bound lacks what every key shares and sorts before them
-            // all: the scan starts at the first leaf, and compares each of
-            // its entries with the bound. A shrink of the shared prefix
+            // all: the scan starts at the first leaf, and places the bound
+            // among its keys as in any other. A shrink of the shared prefix
             // since, which may have put keys before the bound, holds the
             // border leaves and bumps their versions: a copy of the first
             // leaf from before it then fails its check.
@@ -180,12 +191,36 @@ impl<K: Copy, V: Copy, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
         // threads share it, its header initialized.
         let (has_head, len) = unsafe { (page.load_racing_has_head(), page.load_racing_header().0) };
         let len = len.min(Leaf::<K, V, Latched<S>>::capacity());
+        // The key the copy starts at, and whether the keys copied are still
+        // compared with `from`: the first at or past it ends that, as the
+        // keys are in order.
+        let (first_key, mut before_start) = match from {
+            Bound::Unbounded => (0, false),
+            Bound::Included(_) | Bound::Excluded(_) => {
+                match Self::place_racing(leaf, version, len, from) {
+                    Some(first_key) => (first_key, true),
+                    None => return Visited::Changed(None),
+                }
+            }
+        };
         let mut chunk: [MaybeUninit<RacingEntry<K, V>>; CHUNK] =
             [const { MaybeUninit::uninit() }; CHUNK];
         let mut seen = None;
-        // The head goes first in the first chunk, then the keys, in order.
-        let mut head_pending = has_head;
-        let mut next_key = 0;
+        // The head goes first in the first chunk, then the keys, in order. A
+        // copy that starts past key 0 leaves the head out: it sorts before
+        // key 0, which sorts before `from`.
+        let mut head_pending = has_head && first_key == 0;
+        let mut next_key = first_key;
+        if !head_pending && next_key >= len {
+            // Nothing to copy, so no chunk's check would catch a header read
+            // while the leaf changed: as read, it has no entry from
+            // `first_key` on only if its version held.
+            return if leaf.latch().is_unchanged(version) {
+                Visited::Exhausted(None)
+            } else {
+                Visited::Changed(None)
+            };
+        }
         while head_pending || next_key < len {
             let mut filled = 0;
             if head_pending {
@@ -204,6 +239,10 @@ impl<K: Copy, V: Copy, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
             if !leaf.latch().is_unchanged(version) {
                 return Visited::Changed(seen);
             }
+            // The entries are read where they were copied to, and the last
+            // key visited is kept once a chunk: a key moved for every entry
+            // costs a wide key a scan a good part of its time.
+            let mut visited = None;
             for slot in &chunk[..filled] {
                 // SAFETY: the slot was written above. The leaf stayed at
                 // `version`, with no thread holding it exclusively, from
@@ -212,21 +251,73 @@ impl<K: Copy, V: Copy, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
                 // its length as read. The copies are of `Copy` keys and
                 // values, which own nothing, so they stand once the leaf
                 // changes.
-                let (key, value) = unsafe { slot.assume_init_read().assume_read() };
-                let (key, value) = (*key, *value);
-                if !Self::past_start(&key, from) {
-                    continue;
+                let (key, value) = unsafe { slot.assume_init_ref().assume_read_ref() };
+                if before_start {
+                    if !Self::past_start(key, from) {
+                        continue;
+                    }
+                    before_start = false;
                 }
-                if Self::past_end(&key, to) {
+                if Self::past_end(key, to) {
                     return Visited::PastEnd;
                 }
-                seen = Some(key);
-                if let ControlFlow::Break(result) = f(&key, &value) {
+                visited = Some(key);
+                if let ControlFlow::Break(result) = f(key, value) {
                     return Visited::Broke(result);
                 }
             }
+            if let Some(key) = visited {
+                seen = Some(*key);
+            }
         }
         Visited::Exhausted(seen)
+    }
+
+    /// The key a copy of `leaf`, read at `version` with `len` keys, starts
+    /// at for a scan from `from`: the first key of the last chunk whose
+    /// first key sorts before `from`, found by the keys at the chunk
+    /// boundaries, read in place and checked by the version before they are
+    /// compared; `None` if the leaf changed meanwhile. Every key before it
+    /// sorts before `from`. In a leaf of more than [`PROBES`] chunks, the
+    /// boundaries read are every so many, and the copy starts that much
+    /// earlier at most.
+    #[inline(always)]
+    fn place_racing<Q>(
+        leaf: Leaf<K, V, Latched<S>>,
+        version: Version,
+        len: usize,
+        from: Bound<&Q>,
+    ) -> Option<usize>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        // The chunk boundaries below `len`: `CHUNK`, `2 * CHUNK`, and so on.
+        let boundaries = len.saturating_sub(1) / CHUNK;
+        if boundaries == 0 {
+            return Some(0);
+        }
+        let stride = CHUNK * boundaries.div_ceil(PROBES);
+        let probed = (len - 1) / stride;
+        let mut probes: [MaybeUninit<K>; PROBES] = [const { MaybeUninit::uninit() }; PROBES];
+        for (probe, slot) in probes[..probed].iter_mut().enumerate() {
+            *slot = leaf.load_racing_key((probe + 1) * stride);
+        }
+        if !leaf.latch().is_unchanged(version) {
+            return None;
+        }
+        let mut first_key = 0;
+        for (probe, slot) in probes[..probed].iter().enumerate() {
+            // SAFETY: the slot was written above, with a key below `len` as
+            // read, and the leaf stayed at `version` from before the reads
+            // to after them (checked just above). A `Copy` key owns nothing.
+            let key = unsafe { slot.assume_init_ref() };
+            if Self::past_start(key, from) {
+                break;
+            }
+            first_key = (probe + 1) * stride;
+        }
+        Some(first_key)
     }
 
     /// The rest of a scan, the latched way (`scan.rs`): from past `last`,
