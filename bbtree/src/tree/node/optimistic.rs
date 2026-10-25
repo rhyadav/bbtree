@@ -191,6 +191,40 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
         }
     }
 
+    /// Copies of keys `start..start + out.len()` and their values, read in
+    /// place while writers may change them, one entry a slot of `out`:
+    /// entries of the leaf only if its version is unchanged after
+    /// ([`RacingEntry`]). The slots' addresses are computed once for all of
+    /// them, where [`Self::load_racing_entry`] computes them for each.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, if the last index is not below the capacity.
+    #[inline(always)]
+    pub(in crate::tree) fn load_racing_entries(
+        self,
+        start: usize,
+        out: &mut [MaybeUninit<RacingEntry<K, V>>],
+    ) {
+        debug_assert!(start + out.len() <= Self::capacity());
+        let page = self.node_ptr();
+        // SAFETY: every index is below the capacity, so its key slot and
+        // value slot are in the page, which is a leaf's, allocated while
+        // threads share the tree. Both are read as plain bytes, which
+        // `MaybeUninit` holds whatever they are.
+        unsafe {
+            let keys = page.key_slots::<Self>().keys();
+            let values = page.value_slots();
+            for (offset, slot) in out.iter_mut().enumerate() {
+                let index = start + offset;
+                slot.write(RacingEntry {
+                    key: keys.slot(index).cast().read(),
+                    value: values.slot(index).cast().read(),
+                });
+            }
+        }
+    }
+
     /// A copy of value `index`, read in place while writers may change it:
     /// the value of key `index` only if the leaf's version is unchanged
     /// after.

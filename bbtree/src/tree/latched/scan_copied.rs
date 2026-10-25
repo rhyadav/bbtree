@@ -180,29 +180,31 @@ impl<K: Copy, V: Copy, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
         // threads share it, its header initialized.
         let (has_head, len) = unsafe { (page.load_racing_has_head(), page.load_racing_header().0) };
         let len = len.min(Leaf::<K, V, Latched<S>>::capacity());
-        let entry_count = usize::from(has_head) + len;
         let mut chunk: [MaybeUninit<RacingEntry<K, V>>; CHUNK] =
             [const { MaybeUninit::uninit() }; CHUNK];
         let mut seen = None;
-        let mut visited = 0;
-        while visited < entry_count {
-            let taking = (entry_count - visited).min(CHUNK);
-            for (slot, position) in chunk.iter_mut().zip(visited..visited + taking) {
-                let entry = if has_head && position == 0 {
-                    match leaf.load_racing_head_entry() {
-                        Some(head) => head,
-                        // The head went meanwhile, and so did the version.
-                        None => return Visited::Changed(seen),
-                    }
-                } else {
-                    leaf.load_racing_entry(position - usize::from(has_head))
+        // The head goes first in the first chunk, then the keys, in order.
+        let mut head_pending = has_head;
+        let mut next_key = 0;
+        while head_pending || next_key < len {
+            let mut filled = 0;
+            if head_pending {
+                match leaf.load_racing_head_entry() {
+                    Some(head) => chunk[0].write(head),
+                    // The head went meanwhile, and so did the version.
+                    None => return Visited::Changed(seen),
                 };
-                slot.write(entry);
+                filled = 1;
+                head_pending = false;
             }
+            let taking = (len - next_key).min(CHUNK - filled);
+            leaf.load_racing_entries(next_key, &mut chunk[filled..filled + taking]);
+            filled += taking;
+            next_key += taking;
             if !leaf.latch().is_unchanged(version) {
                 return Visited::Changed(seen);
             }
-            for slot in &chunk[..taking] {
+            for slot in &chunk[..filled] {
                 // SAFETY: the slot was written above. The leaf stayed at
                 // `version`, with no thread holding it exclusively, from
                 // before the reads to after them (checked just above), and
@@ -223,7 +225,6 @@ impl<K: Copy, V: Copy, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
                     return Visited::Broke(result);
                 }
             }
-            visited += taking;
         }
         Visited::Exhausted(seen)
     }

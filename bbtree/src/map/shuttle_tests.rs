@@ -280,6 +280,67 @@ fn assert_visited_in_order<K: Ord + fmt::Debug>(visited: &[K], steady: &[K]) {
     }
 }
 
+/// A map of plain `u64` values, each its key, for copied scans, which take
+/// copies of `Copy` values: `len` keys.
+fn plain_map_of(len: u64) -> BBTreeMap<u64, u64> {
+    let map = BBTreeMap::new();
+    for index in 0..len {
+        map.insert(key(index), key(index)).unwrap();
+    }
+    map
+}
+
+/// [`Shapes`] for a plain map, whose leaves hold more entries than a
+/// [`TrackedMap`]'s: the root leaf's capacity, and the length at which a
+/// tree of two levels is one removal from lowering.
+struct PlainShapes {
+    capacity: u64,
+    lowering_len: u64,
+}
+
+impl PlainShapes {
+    fn probe() -> Self {
+        let mut map = BBTreeMap::<u64, u64>::new();
+        let mut len = 0;
+        while map.node_lengths().len() <= 1 {
+            map.insert(key(len), key(len)).unwrap();
+            len += 1;
+        }
+        let capacity = len - 1;
+        while map.node_lengths().len() > 1 {
+            len -= 1;
+            map.remove(&key(len));
+        }
+        Self {
+            capacity,
+            lowering_len: len + 1,
+        }
+    }
+
+    /// A tree of two levels, which a removal of its last key lowers to its
+    /// root leaf. Returns how many keys it holds.
+    fn one_removal_from_lowering(&self) -> (BBTreeMap<u64, u64>, u64) {
+        let raised = self.capacity + 1;
+        let map = plain_map_of(raised);
+        for index in self.lowering_len..raised {
+            assert!(map.remove(&key(index)).is_some());
+        }
+        (map, self.lowering_len)
+    }
+}
+
+/// Visits `range` of a plain map with `scan_copied`, checking each value
+/// is its key's, and returns the keys visited.
+fn copied_scanned_keys(map: &BBTreeMap<u64, u64>, range: impl RangeBounds<u64>) -> Vec<u64> {
+    let mut keys = Vec::new();
+    map.scan_copied::<u64, ()>(range, |&key, &value| {
+        assert_eq!(value, key, "the value of {key}");
+        keys.push(key);
+        ControlFlow::Continue(())
+    });
+    keys
+}
+
 /// The number of a `u64` key, its value's.
 fn same(key: &u64) -> u64 {
     *key
@@ -559,6 +620,117 @@ fn scans_from_outside_the_shared_prefix_race_a_shrink() {
                     let (last, value) = range.next_back().expect("steady keys");
                     value.check(last);
                     assert_eq!([first, last], [steady[0], steady[steady.len() - 1]]);
+                });
+            });
+            assert!(map.shared_prefix_len() < 3);
+            map.check_invariants(steady.len() + 2);
+        }
+    });
+}
+
+/// Copied scans while the tree lowers from two leaves into its root leaf:
+/// a scan that read the root as internal must not take the leaf's bytes
+/// for edges, and copies of the leaf that merged away must not be used.
+#[test]
+fn copied_scans_race_the_root_lowering_to_a_leaf() {
+    let shapes = PlainShapes::probe();
+    Exploration {
+        random: 20_000,
+        pct: 20_000,
+    }
+    .run(move || {
+        let (mut map, len) = shapes.one_removal_from_lowering();
+        let steady: Vec<u64> = (0..len - 1).map(key).collect();
+        thread::scope(|scope| {
+            scope.spawn(|| assert!(map.remove(&key(len - 1)).is_some()));
+            scope.spawn(|| {
+                assert_visited_in_order(&copied_scanned_keys(&map, ..), &steady);
+                assert_visited_in_order(&copied_scanned_keys(&map, key(1)..), &steady[1..]);
+            });
+        });
+        assert_eq!(map.node_lengths().len(), 1, "the root lowered to a leaf");
+        map.check_invariants(steady.len());
+    });
+}
+
+/// Copied scans while appends split the root leaf, raising the tree, and
+/// then the last leaf: every steady key is visited once, in order, whether
+/// a scan copied a leaf before or after its split.
+#[test]
+fn copied_scans_race_splits_of_the_last_leaf() {
+    let shapes = PlainShapes::probe();
+    Exploration {
+        random: 20_000,
+        pct: 20_000,
+    }
+    .run(move || {
+        let len = shapes.capacity;
+        let mut map = plain_map_of(len);
+        let steady: Vec<u64> = (0..len).map(key).collect();
+        let appended: Vec<u64> = (len..len + 3).map(key).collect();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                for &key in &appended {
+                    assert!(map.insert(key, key).unwrap().is_none());
+                }
+            });
+            scope.spawn(|| {
+                assert_visited_in_order(&copied_scanned_keys(&map, ..), &steady);
+                let middle = &steady[2..len as usize - 1];
+                assert_eq!(copied_scanned_keys(&map, key(2)..key(len - 1)), middle);
+            });
+        });
+        assert_eq!(map.node_lengths().len(), 2, "the root was raised");
+        map.check_invariants(steady.len() + appended.len());
+    });
+}
+
+/// Copied scans of a range whose bounds lack what every key shares, just
+/// outside the keys, while another thread inserts a key past each bound,
+/// the first shrinking the shared prefix: a scan that read its starting
+/// bound as before every key must not visit a key the shrink put before the
+/// bound.
+#[test]
+fn copied_scans_from_outside_the_shared_prefix_race_a_shrink() {
+    let shapes = PlainShapes::probe();
+    Exploration {
+        random: 20_000,
+        pct: 20_000,
+    }
+    .run(move || {
+        for len in [4, 2 * shapes.capacity] {
+            let base = 0xAB << 40;
+            let mut map = BBTreeMap::<u64, u64>::new();
+            for index in 0..len {
+                map.insert(base + key(index), base + key(index)).unwrap();
+            }
+            assert!(map.shared_prefix_len() >= 3);
+            let steady: Vec<u64> = (0..len).map(|index| base + key(index)).collect();
+            // Each differs from every key in the shared third byte.
+            let (below, above) = (0xAA << 40, 0xAC << 40);
+            let mut outside = [0xA9 << 40, 0xAD << 40];
+            if thread_rng().gen_range(0..2) == 1 {
+                outside.reverse();
+            }
+            thread::scope(|scope| {
+                scope.spawn(|| {
+                    for key in outside {
+                        assert!(map.insert(key, key).unwrap().is_none());
+                    }
+                });
+                scope.spawn(|| {
+                    assert_eq!(copied_scanned_keys(&map, below..=above), steady);
+                    // Unbounded above, the scan may visit the key inserted
+                    // past `above` too, and nothing else.
+                    let visited = copied_scanned_keys(&map, below..);
+                    assert_eq!(&visited[..steady.len()], &steady[..]);
+                    assert!(
+                        visited.len() <= steady.len() + 1
+                            && visited
+                                .get(steady.len())
+                                .is_none_or(|&key| key == 0xAD << 40),
+                        "{visited:?}"
+                    );
                 });
             });
             assert!(map.shared_prefix_len() < 3);
