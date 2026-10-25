@@ -343,7 +343,7 @@ impl<K: Copy, V: Copy, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
     }
 
     /// Whether `key` is at or past the bound a scan starts from.
-    fn past_start<Q>(key: &K, from: Bound<&Q>) -> bool
+    pub(super) fn past_start<Q>(key: &K, from: Bound<&Q>) -> bool
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -356,7 +356,7 @@ impl<K: Copy, V: Copy, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
     }
 
     /// Whether `key` is past the bound a scan stops at.
-    fn past_end<Q>(key: &K, to: Bound<&Q>) -> bool
+    pub(super) fn past_end<Q>(key: &K, to: Bound<&Q>) -> bool
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,

@@ -685,6 +685,146 @@ fn copied_scans_race_splits_of_the_last_leaf() {
     });
 }
 
+/// Copied firsts while the tree lowers from two leaves into its root leaf:
+/// a first read at the root as internal must not take the leaf's bytes for
+/// edges, and a copy out of the leaf that merged away must not be used.
+#[test]
+fn copied_firsts_race_the_root_lowering_to_a_leaf() {
+    let shapes = PlainShapes::probe();
+    Exploration {
+        random: 20_000,
+        pct: 20_000,
+    }
+    .run(move || {
+        let (mut map, len) = shapes.one_removal_from_lowering();
+        thread::scope(|scope| {
+            scope.spawn(|| assert!(map.remove(&key(len - 1)).is_some()));
+            scope.spawn(|| {
+                assert_eq!(map.first_copied(..), Some((key(0), key(0))));
+                for index in [0, 1, len / 2, len - 3] {
+                    assert_eq!(
+                        map.first_copied(key(index)..),
+                        Some((key(index), key(index)))
+                    );
+                    assert_eq!(
+                        map.first_copied((key(index) + 1)..),
+                        Some((key(index + 1), key(index + 1))),
+                        "past {}",
+                        key(index)
+                    );
+                }
+                // The last key may be gone or not.
+                for from in [key(len - 2) + 1, key(len - 1)] {
+                    assert!(
+                        map.first_copied(from..)
+                            .is_none_or(|entry| entry == (key(len - 1), key(len - 1))),
+                        "from {from}"
+                    );
+                }
+            });
+        });
+        assert_eq!(map.node_lengths().len(), 1, "the root lowered to a leaf");
+        map.check_invariants(len as usize - 1);
+    });
+}
+
+/// Copied firsts while appends split the root leaf, raising the tree, and
+/// then the last leaf: every steady key is found from itself and from just
+/// before it, whether the first read its leaf before or after a split.
+#[test]
+fn copied_firsts_race_splits_of_the_last_leaf() {
+    let shapes = PlainShapes::probe();
+    Exploration {
+        random: 20_000,
+        pct: 20_000,
+    }
+    .run(move || {
+        let len = shapes.capacity;
+        let mut map = plain_map_of(len);
+        let appended: Vec<u64> = (len..len + 3).map(key).collect();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                for &key in &appended {
+                    assert!(map.insert(key, key).unwrap().is_none());
+                }
+            });
+            scope.spawn(|| {
+                for index in [0, 1, len / 2, len - 2, len - 1] {
+                    assert_eq!(
+                        map.first_copied(key(index)..),
+                        Some((key(index), key(index)))
+                    );
+                    assert_eq!(
+                        map.first_copied((key(index) - 1)..),
+                        Some((key(index), key(index)))
+                    );
+                }
+                // Past the steady keys: the first appended key, once there.
+                assert!(
+                    map.first_copied((key(len - 1) + 1)..)
+                        .is_none_or(|entry| entry == (key(len), key(len)))
+                );
+            });
+        });
+        assert_eq!(map.node_lengths().len(), 2, "the root was raised");
+        map.check_invariants(len as usize + appended.len());
+    });
+}
+
+/// Copied firsts from bounds that lack what every key shares, just outside
+/// the keys, while another thread inserts a key past each bound, the first
+/// shrinking the shared prefix: a first that read its bound as before every
+/// key must not return a key the shrink put before the bound.
+#[test]
+fn copied_firsts_from_outside_the_shared_prefix_race_a_shrink() {
+    let shapes = PlainShapes::probe();
+    Exploration {
+        random: 20_000,
+        pct: 20_000,
+    }
+    .run(move || {
+        for len in [4, 2 * shapes.capacity] {
+            let base = 0xAB << 40;
+            let mut map = BBTreeMap::<u64, u64>::new();
+            for index in 0..len {
+                map.insert(base + key(index), base + key(index)).unwrap();
+            }
+            assert!(map.shared_prefix_len() >= 3);
+            let (first, last) = (base + key(0), base + key(len - 1));
+            // Each differs from every key in the shared third byte.
+            let (below, above) = (0xAA << 40, 0xAC << 40);
+            let mut outside = [0xA9 << 40, 0xAD << 40];
+            if thread_rng().gen_range(0..2) == 1 {
+                outside.reverse();
+            }
+            thread::scope(|scope| {
+                scope.spawn(|| {
+                    for key in outside {
+                        assert!(map.insert(key, key).unwrap().is_none());
+                    }
+                });
+                scope.spawn(|| {
+                    assert_eq!(map.first_copied(below..), Some((first, first)));
+                    assert_eq!(map.first_copied(below..=above), Some((first, first)));
+                    assert_eq!(map.first_copied(first..), Some((first, first)));
+                    assert_eq!(map.first_copied(last..), Some((last, last)));
+                    // Past every steady key: the key inserted above, once
+                    // there, and nothing else.
+                    for from in [(last + 1)..u64::MAX, above..u64::MAX] {
+                        assert!(
+                            map.first_copied(from.clone())
+                                .is_none_or(|entry| entry == (0xAD << 40, 0xAD << 40)),
+                            "{from:?}"
+                        );
+                    }
+                });
+            });
+            assert!(map.shared_prefix_len() < 3);
+            map.check_invariants(len as usize + 2);
+        }
+    });
+}
+
 /// Copied scans of a range whose bounds lack what every key shares, just
 /// outside the keys, while another thread inserts a key past each bound,
 /// the first shrinking the shared prefix: a scan that read its starting
